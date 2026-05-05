@@ -1,6 +1,6 @@
 # 视频总结应用（Video Summary App）
 
-一个一站式的长视频学习助手：输入 YouTube / Bilibili 等平台的链接，程序会自动完成视频/字幕下载、字幕分段、Gemini 总结、关键帧抓取，并输出带截图的 Markdown 学习笔记。支持自定义输出目录、帧提取参数、测试模式、Cookies 认证等多种配置，方便迁移到本地或自动化流水线。
+一个一站式的长视频学习助手：输入 YouTube / Bilibili 等平台的链接，程序会自动完成视频/字幕下载、字幕分段、DeepSeek 总结、关键帧抓取，并输出带截图的 Markdown 学习笔记。支持自定义输出目录、帧提取参数、测试模式、Cookies 认证等多种配置，方便迁移到本地或自动化流水线。
 
 目前功能仍然非常简陋，仅有我个人使用且未经大量测试，欢迎大家交流想法！欢迎Fork，欢迎二次开发。
 
@@ -16,7 +16,7 @@
 
 - Python
 - `pip install -r requirements.txt`
-- 可用的 Google Gemini API Key
+- 可用的 DeepSeek API Key
 
 ---
 
@@ -29,21 +29,21 @@ python -m venv .venv && source .venv/bin/activate  # Windows: .venv\Scripts\acti
 pip install -r requirements.txt
 ```
 
-### 配置 Gemini API Key
+### 配置 DeepSeek API Key
 
 支持两种方式：
 
 1. **环境变量（推荐）**
    ```powershell
    # PowerShell
-   $Env:GEMINI_API_KEY = "your_key_here"
+   $Env:DEEPSEEK_API_KEY = "your_key_here"
    ```
    ```bash
    # Bash
-   export GEMINI_API_KEY="your_key_here"
+   export DEEPSEEK_API_KEY="your_key_here"
    ```
 2. **代码里写死**  
-   修改 `video_summary_app.py` 顶部的 `GEMINI_API_KEY` 字段（不推荐在公共仓库使用）。
+   修改 `video_summary_app.py` 顶部的 `DEEPSEEK_API_KEY` 字段（不推荐在公共仓库使用）。
 
 ### 准备 Cookies（可选）
 
@@ -110,7 +110,7 @@ python video_summary_app.py "https://www.youtube.com/watch?v=dQw4w9WgXcQ" -n -c 
 
 3. **生成总结 & 抓帧（并行）**  
    - `ThreadPoolExecutor` 开两个任务：  
-     - `_generate_summary_with_chunks`：按片段调用 Gemini，总结写入 `{title}_summary_temp.md`。  
+     - `_generate_summary_with_chunks`：按片段调用 DeepSeek，总结写入 `{title}_summary_temp.md`。  
      - `_extract_frames_for_chunks`：调用 `TimeRangeExtractor` 在对应时间段抓帧，目录格式 `chunk_01_00m00s-05m30s/`。
 
 4. **合成最终 Markdown**  
@@ -139,7 +139,7 @@ output/
 ## 高级配置
 
 - **提示词**：修改 `BASE_SYSTEM_PROMPT` 可切换总结语气/结构（注意保持 `${current}` / `${total}` 占位符）。  
-- **模型 / API 版本**：调整 `PRIMARY_MODEL` 或创建不同的 `genai.Client` 配置。  
+- **模型 / API 版本**：调整 `PRIMARY_MODEL`、`DEEPSEEK_BASE_URL` 可切换不同 DeepSeek 模型或兼容接口。  
 - **文本切片**：`CHUNK_SIZE`、`OVERLAP` 定义在 `process_video` 内，可针对不同语言/视频类型调整。  
 - **帧提取策略**：`TimeRangeExtractor.extract_frames_in_range` 支持 `skip_similar`、图片格式、质量等参数；如需更细粒度可改写函数。  
 - **测试模式**：`-t / --test` 会直接把 Prompt 写进总结文件，用于检查上下文是否正确，适合调试提示词或 chunk 大小。
@@ -154,8 +154,8 @@ output/
 2. **截图和内容不匹配？**  
    文本到时间段的映射基于字幕时间戳，若字幕与画面不同步可适当增大 `interval`、修改 `TextToTimeMapper` 或手动挑选关键帧。
 
-3. **Gemini 报错 / 速率限制？**  
-   检查 `GEMINI_API_KEY` 是否正确，或在 `.env` / 环境变量里配置多个 Key。必要时可以切换为较低延迟模型。
+3. **DeepSeek 报错 / 速率限制？**  
+   检查 `DEEPSEEK_API_KEY` 是否正确，或在 `.env` / 环境变量里配置。必要时可以切换为其他模型。
 
 4. **大视频耗时太久？**  
    - 使用其他下载器把视频下载到本地，然后使用 `--local-video` 参数指定本地视频文件路径。  

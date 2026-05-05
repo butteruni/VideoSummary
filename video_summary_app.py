@@ -21,9 +21,9 @@ import cv2
 import numpy as np
 
 try:
-    from google import genai
+    from openai import OpenAI
 except ImportError:
-    genai = None
+    OpenAI = None
 
 INVALID_PATH_CHARS = set('<>:"/\\|?*')
 
@@ -61,8 +61,9 @@ def chinese_char_ratio(text: str) -> float:
 
 
 # ==== LLM 配置（可根据需要修改）====
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-PRIMARY_MODEL = "gemini-2.5-pro"
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
+DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+PRIMARY_MODEL = "deepseek-chat"
 BASE_SYSTEM_PROMPT = """
 ## Background Information
 
@@ -296,21 +297,23 @@ def detect_language(content: str, chinese_threshold: float = 0.1) -> str:
 def generate_chunk_summary(client, chunk_text: str, current_idx: int,
                            total_chunks: int, model_name: str = PRIMARY_MODEL) -> str:
     """
-    调用 Gemini 模型生成单个片段的总结
+    调用 DeepSeek API 生成单个片段的总结
     """
     if client is None:
-        raise RuntimeError("genai client 未初始化")
+        raise RuntimeError("DeepSeek client 未初始化")
 
     prompt = BASE_SYSTEM_PROMPT.format(
         current=current_idx, total=total_chunks) + "\n\n" + chunk_text
 
     logger.info(
         f"   >>> LLM 总结第 {current_idx}/{total_chunks} 片段，长度 {len(chunk_text)} 字")
-    response = client.models.generate_content(
+    response = client.chat.completions.create(
         model=model_name,
-        contents=prompt,
+        messages=[
+            {"role": "user", "content": prompt}
+        ],
     )
-    return response.text
+    return response.choices[0].message.content
 
 
 # 配置日志
@@ -491,29 +494,46 @@ class VideoDownloader:
             )
             available_subs = sub_output.stdout
 
+            # 解析 --list-subs 输出，提取实际的语言代码（如 en-US, ai-zh）
+            available_langs = set()
+            for line in available_subs.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split()
+                if len(parts) >= 2 and parts[0] not in ('Language', 'Available'):
+                    lang = parts[0]
+                    # 过滤掉不是语言代码的行（如 danmaku, info 等）
+                    if re.match(r'^[a-zA-Z][a-zA-Z_-]*$', lang) and not lang.lower().startswith('info'):
+                        available_langs.add(lang)
+            logger.info(f"📋 可用字幕语言: {available_langs}")
+
             zh_first_preferences = [
-                (r'\bai-zh\b', 'ai-zh', "找到简体中文字幕 ai-zh"),
-                (r'\b(zh-cn|zh_CN|chinese)\b', 'zh-cn', "找到简体中文字幕"),
-                (r'\b(zh-tw|zh_TW)\b', 'zh-tw', "找到繁体中文字幕"),
-                (r'\bzh\b', 'zh', "找到中文字幕"),
-                (r'\bai-en\b', 'ai-en', "找到英文字幕 ai-en"),
-                (r'\b(en|english)\b', 'en', "找到英文字幕")
+                (r'ai-zh', "找到简体中文字幕 ai-zh"),
+                (r'zh-cn|zh_CN|chinese|zh-Hans', "找到简体中文字幕"),
+                (r'zh-tw|zh_TW|zh-Hant', "找到繁体中文字幕"),
+                (r'\bzh\b', "找到中文字幕"),
+                (r'ai-en', "找到英文字幕 ai-en"),
+                (r'(?i)^en', "找到英文字幕"),
             ]
             en_first_preferences = [
-                (r'\bai-en\b', 'ai-en', "找到英文字幕 ai-en"),
-                (r'\b(en|english)\b', 'en', "找到英文字幕"),
-                (r'\bai-zh\b', 'ai-zh', "找到简体中文字幕 ai-zh"),
-                (r'\b(zh-cn|zh_CN|chinese)\b', 'zh-cn', "找到简体中文字幕"),
-                (r'\b(zh-tw|zh_TW)\b', 'zh-tw', "找到繁体中文字幕"),
-                (r'\bzh\b', 'zh', "找到中文字幕")
+                (r'ai-en', "找到英文字幕 ai-en"),
+                (r'(?i)^en', "找到英文字幕"),
+                (r'ai-zh', "找到简体中文字幕 ai-zh"),
+                (r'zh-cn|zh_CN|chinese|zh-Hans', "找到简体中文字幕"),
+                (r'zh-tw|zh_TW|zh-Hant', "找到繁体中文字幕"),
+                (r'\bzh\b', "找到中文字幕"),
             ]
 
             lang_preferences = zh_first_preferences if prefer_chinese else en_first_preferences
 
-            for pattern, code, message in lang_preferences:
-                if re.search(pattern, available_subs, re.IGNORECASE):
-                    subtitle_lang = code
-                    logger.info(message)
+            for pattern, message in lang_preferences:
+                for lang in sorted(available_langs):
+                    if re.search(pattern, lang, re.IGNORECASE):
+                        subtitle_lang = lang
+                        logger.info(f"{message}: {lang}")
+                        break
+                if subtitle_lang:
                     break
 
             if not subtitle_lang:
@@ -647,12 +667,12 @@ class VideoDownloader:
             # 下载字幕（如果可用，只下载srt格式）
             subtitle_path = None
             if subtitle_lang and subtitle_lang != 'all':
-                logger.info(f"正在下载字幕 ({subtitle_lang})，仅SRT格式...")
+                logger.info(f"正在下载字幕 ({subtitle_lang})...")
                 subtitle_cmd = self._build_ytdlp_command([
                     '--write-subs',
                     '--write-auto-subs',  # 也下载自动生成的字幕
                     '--sub-langs', subtitle_lang,
-                    '--sub-format', 'srt',  # 只下载srt格式
+                    '--convert-subs', 'srt',  # 自动转换为 SRT
                     '--skip-download',
                     '-o', subtitle_template,
                     url
@@ -666,12 +686,12 @@ class VideoDownloader:
 
             # 如果subtitle_lang是'all'，尝试下载所有字幕（仅srt格式）
             if subtitle_lang == 'all':
-                logger.info("尝试下载所有可用字幕（仅SRT格式）...")
+                logger.info("尝试下载所有可用字幕...")
                 try:
                     subtitle_cmd = self._build_ytdlp_command([
                         '--write-subs',
                         '--write-auto-subs',
-                        '--sub-format', 'srt',  # 只下载srt格式
+                        '--convert-subs', 'srt',  # 自动转换为 SRT
                         '--skip-download',
                         '-o', subtitle_template,
                         url
@@ -688,7 +708,7 @@ class VideoDownloader:
                     logger.info(
                         f"选择字幕文件: {os.path.basename(subtitle_path)}")
         # 对字幕进行去重处理
-        if subtitle_path.endswith('.srt'):
+        if subtitle_path and subtitle_path.endswith('.srt'):
             remove_duplicates_from_srt(subtitle_path)
 
         return {
@@ -731,7 +751,7 @@ class VideoDownloader:
         best_score = -1
 
         for filename in os.listdir(self.output_dir):
-            if not filename.lower().endswith('.srt'):
+            if not filename.lower().endswith(('.srt', '.vtt')):
                 continue
             file_path = os.path.join(self.output_dir, filename)
             if os.path.getsize(file_path) <= 0:
@@ -1374,16 +1394,15 @@ class VideoSummaryApp:
                 summaries.append(prompt)
         else:
             # 检查API KEY
-            api_key = os.environ.get("GEMINI_API_KEY", GEMINI_API_KEY)
+            api_key = os.environ.get("DEEPSEEK_API_KEY", DEEPSEEK_API_KEY)
             if not api_key or "YOUR_API_KEY" in api_key:
-                raise ValueError("GEMINI_API_KEY 未设置，请配置环境变量或在代码中填写。")
-            if genai is None:
+                raise ValueError("DEEPSEEK_API_KEY 未设置，请配置环境变量或在代码中填写。")
+            if OpenAI is None:
                 raise ImportError(
-                    "未找到 google-genai，请先安装: pip install google-genai")
+                    "未找到 openai，请先安装: pip install openai")
 
             try:
-                client = genai.Client(api_key=api_key, http_options={
-                    'api_version': 'v1alpha'})
+                client = OpenAI(api_key=api_key, base_url=DEEPSEEK_BASE_URL)
             except Exception as e:
                 logger.error(f"初始化API客户端失败: {e}")
                 raise
@@ -1742,6 +1761,13 @@ def main():
     try:
         # 验证 cookies 文件是否存在
         cookies_file = args.cookies
+        if not cookies_file:
+            # 自动检测项目根目录下的 cookies.txt
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            auto_cookie = os.path.join(script_dir, "cookies.txt")
+            if os.path.exists(auto_cookie):
+                cookies_file = auto_cookie
+                logger.info(f"🍪 自动检测到 Cookies 文件: {auto_cookie}")
         if cookies_file and not os.path.exists(cookies_file):
             logger.warning(f"警告: Cookies 文件不存在: {cookies_file}，将不使用 cookies")
             cookies_file = None
