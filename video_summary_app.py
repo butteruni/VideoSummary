@@ -1031,7 +1031,9 @@ class VideoSummaryApp:
     """视频总结应用主类"""
 
     def __init__(self, output_dir: str = "output", test_mode: bool = False,
-                 text_only: bool = False, cookies_file: str = None):
+                 text_only: bool = False, cookies_file: str = None,
+                 push_to_github: bool = False,
+                 push_to_notion: bool = False):
         """
         初始化应用
 
@@ -1040,6 +1042,8 @@ class VideoSummaryApp:
             test_mode: 是否启用测试模式（不调用LLM，仅输出Prompt）
             text_only: Non video模式，仅生成文本总结
             cookies_file: Cookies 文件路径（用于 Bilibili 等需要登录的网站）
+            push_to_github: 处理完成后是否自动 git push
+            push_to_notion: 处理完成后是否自动推送到 Notion
         """
         self.output_dir = output_dir
         os.makedirs(output_dir, exist_ok=True)
@@ -1048,6 +1052,8 @@ class VideoSummaryApp:
         self.time_extractor = TimeRangeExtractor()
         self.test_mode = test_mode
         self.text_only = text_only
+        self.push_to_github = push_to_github
+        self.push_to_notion = push_to_notion
 
     def process_video(self, url: Optional[str] = None,
                       frame_extraction_interval: float = 2.0,
@@ -1216,8 +1222,10 @@ class VideoSummaryApp:
         # 5. 生成最终markdown
         logger.info("\n[步骤 5/5] 生成最终markdown文档...")
         # 获取原始文件名（用于输出文件名和标题）
-        original_filename = None
-        if video_path:
+        # provided_title 优先；否则从文件路径推断
+        if provided_title:
+            original_filename = video_title
+        elif video_path:
             original_filename = os.path.splitext(
                 os.path.basename(video_path))[0]
         elif subtitle_path:
@@ -1233,12 +1241,200 @@ class VideoSummaryApp:
         # 清理中间产物
         self._cleanup_temp_files([temp_text_file, summary_path])
 
+        # 推送到 GitHub（如果启用 --push）
+        self._push_to_github()
+
+        # 推送到 Notion（如果启用 --notion）
+        self._push_to_notion(final_md_path, original_filename)
+
         logger.info("=" * 60)
         logger.info("✅ 处理完成！")
         logger.info(f"📄 最终文档: {final_md_path}")
         logger.info("=" * 60)
 
         return final_md_path
+
+    def _push_to_github(self) -> None:
+        """
+        将 output 目录下的笔记和截图 git push 到远程仓库。
+        如果 output 目录尚未初始化 git，会自动初始化。
+        如果未配置 remote，则跳过。
+        """
+        import subprocess
+
+        if not self.push_to_github:
+            return
+
+        logger.info("\n[Git Push] 推送笔记到远程仓库...")
+
+        # 检查 git 是否可用
+        try:
+            subprocess.run(
+                ['git', '--version'], capture_output=True, check=True)
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            logger.warning("⚠️  未找到 git，跳过推送")
+            return
+
+        # 如果 output 目录还没有 git 仓库，自动初始化
+        git_dir = os.path.join(self.output_dir, '.git')
+        if not os.path.isdir(git_dir):
+            logger.info("  📦 初始化 git 仓库...")
+            try:
+                subprocess.run(
+                    ['git', 'init'], cwd=self.output_dir,
+                    capture_output=True, check=True)
+            except subprocess.CalledProcessError as e:
+                logger.warning(f"⚠️  git init 失败: {e}")
+                return
+
+        # 检查是否有 remote 配置
+        result = subprocess.run(
+            ['git', 'remote'], cwd=self.output_dir,
+            capture_output=True, text=True)
+        if not result.stdout.strip():
+            logger.warning(
+                "⚠️  未配置 git remote，跳过推送。"
+                "请先执行: git remote add origin <仓库地址>")
+            return
+
+        # 暂存所有 .md 和截图文件（排除 downloads 等大文件）
+        logger.info("  📝 暂存笔记文件...")
+        subprocess.run(
+            ['git', 'add', '*.md', '*_frames/'],
+            cwd=self.output_dir, capture_output=True)
+
+        # 提交（可能没有变更，允许失败）
+        commit_msg = f"📝 {datetime.now().strftime('%Y-%m-%d %H:%M')} 自动提交"
+        commit_result = subprocess.run(
+            ['git', 'commit', '-m', commit_msg],
+            cwd=self.output_dir, capture_output=True, text=True)
+        if commit_result.returncode == 0:
+            logger.info(f"  ✅ 已提交: {commit_msg}")
+        else:
+            if 'nothing to commit' in commit_result.stdout + commit_result.stderr:
+                logger.info("  ℹ️  没有新的变更，跳过提交")
+            else:
+                logger.warning(
+                    f"  ⚠️  提交可能失败: {commit_result.stderr.strip()}")
+                # 不阻断流程，继续尝试 push
+
+        # 推送到远程
+        logger.info("  🚀 推送到远程仓库...")
+        try:
+            push_result = subprocess.run(
+                ['git', 'push', '-u', 'origin', 'HEAD'],
+                cwd=self.output_dir, capture_output=True, text=True,
+                timeout=60)
+            if push_result.returncode == 0:
+                logger.info("  ✅ 推送成功！")
+            else:
+                logger.warning(
+                    f"  ⚠️  推送失败: {push_result.stderr.strip()}")
+        except subprocess.TimeoutExpired:
+            logger.warning("  ⚠️  推送超时，请检查网络连接")
+        except Exception as e:
+            logger.warning(f"  ⚠️  推送异常: {e}")
+
+    def _push_to_notion(
+        self, md_path: str, video_title: str
+    ) -> None:
+        """
+        将生成的 Markdown 笔记推送到 Notion。
+        截图通过 GitHub raw URL 引用，需先执行 --push。
+        """
+        if not hasattr(self, 'push_to_notion') or not self.push_to_notion:
+            return
+
+        logger.info("\n[Notion Push] 推送笔记到 Notion...")
+
+        # 检查环境变量
+        notion_token = os.environ.get("NOTION_TOKEN", "").strip()
+        notion_page_id = os.environ.get("NOTION_PARENT_PAGE_ID", "").strip()
+
+        if not notion_token or not notion_page_id:
+            logger.warning(
+                "⚠️  未配置 Notion 环境变量，跳过推送。"
+                "请设置 NOTION_TOKEN 和 NOTION_PARENT_PAGE_ID")
+            return
+
+        # 从 git remote 解析 GitHub user/repo
+        github_user, github_repo, github_branch = \
+            self._parse_github_remote()
+
+        if not github_user or not github_repo:
+            logger.warning(
+                "⚠️  无法从 git remote 解析 GitHub 仓库信息，跳过 Notion 推送。"
+                "请先执行: git remote add origin git@github.com:user/repo.git")
+            return
+
+        logger.info(
+            f"  仓库: {github_user}/{github_repo} ({github_branch})")
+
+        # 导入并推送
+        try:
+            from notion_publisher import NotionPublisher
+        except ImportError:
+            logger.error(
+                "❌ 无法导入 notion_publisher.py，请确认文件存在且 notion-client 已安装")
+            return
+
+        try:
+            publisher = NotionPublisher(
+                token=notion_token, parent_page_id=notion_page_id)
+            page_url = publisher.push_markdown(
+                md_path=md_path,
+                title=video_title,
+                github_user=github_user,
+                github_repo=github_repo,
+                github_branch=github_branch,
+            )
+            if page_url:
+                logger.info(f"  ✅ Notion 推送成功: {page_url}")
+            else:
+                logger.warning("  ⚠️  Notion 推送未完成，请检查日志")
+        except Exception as e:
+            logger.error(f"  ❌ Notion 推送异常: {e}")
+
+    def _parse_github_remote(self) -> Tuple[str, str, str]:
+        """
+        从 output 目录的 git remote 解析 GitHub 仓库信息。
+
+        Returns:
+            (user, repo, branch) 三元组
+        """
+        import subprocess
+        try:
+            # 获取当前分支
+            branch_result = subprocess.run(
+                ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
+                cwd=self.output_dir, capture_output=True, text=True)
+            branch = branch_result.stdout.strip() or "main"
+
+            # 获取 remote URL
+            remote_result = subprocess.run(
+                ['git', 'remote', 'get-url', 'origin'],
+                cwd=self.output_dir, capture_output=True, text=True)
+            remote_url = remote_result.stdout.strip()
+
+            if not remote_url:
+                return "", "", ""
+
+            # 解析 GitHub URL 格式：
+            #   git@github.com:user/repo.git
+            #   https://github.com/user/repo.git
+            patterns = [
+                r'github\.com[:/]([^/]+)/([^/\s]+?)(?:\.git)?$',
+            ]
+            for pat in patterns:
+                m = re.search(pat, remote_url)
+                if m:
+                    return m.group(1), m.group(2), branch
+
+            logger.warning(f"  无法识别的 git remote 格式: {remote_url}")
+            return "", "", ""
+        except Exception as e:
+            logger.warning(f"  解析 git remote 失败: {e}")
+            return "", "", ""
 
     @staticmethod
     def _cleanup_temp_files(paths: List[str]) -> None:
@@ -1639,6 +1835,10 @@ class VideoSummaryApp:
                     break
 
             if is_duplicate:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
                 continue
 
             deduped.append(path)
@@ -1723,11 +1923,14 @@ def main():
   python video_summary_app.py "https://www.bilibili.com/video/xxx" -o my_output
   python video_summary_app.py "https://www.bilibili.com/video/xxx" -c cookies.txt
   python video_summary_app.py "https://youtube.com/watch?v=xxx" -i 3.0
+  python video_summary_app.py "https://..." --push --notion
   
 参数说明:
   -o: 输出目录（默认: output）
   -i: 帧提取间隔（秒），默认: 2.0
   -c: Cookies 文件路径（用于 Bilibili 等需要登录的网站）
+  --push: 生成笔记后自动 git push 到远程仓库
+  --notion: 生成笔记后自动推送到 Notion（需设置环境变量）
         """
     )
 
@@ -1755,6 +1958,12 @@ def main():
     parser.add_argument(
         '-c', '--cookies', type=str, default=None,
         help='Cookies 文件路径（用于 Bilibili 等需要登录的网站），例如: --cookies cookies.txt')
+    parser.add_argument(
+        '--push', action='store_true',
+        help='处理完成后自动 git push 到远程仓库（需先在 output 目录配置 git remote）')
+    parser.add_argument(
+        '--notion', action='store_true',
+        help='处理完成后推送到 Notion（需设置 NOTION_TOKEN 和 NOTION_PARENT_PAGE_ID 环境变量）')
 
     args = parser.parse_args()
 
@@ -1782,7 +1991,9 @@ def main():
         app = VideoSummaryApp(output_dir=args.output,
                               test_mode=args.test,
                               text_only=args.text_only,
-                              cookies_file=cookies_file)
+                              cookies_file=cookies_file,
+                              push_to_github=args.push,
+                              push_to_notion=args.notion)
         result_path = app.process_video(
             args.url,
             frame_extraction_interval=args.interval,
