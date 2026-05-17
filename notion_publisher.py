@@ -91,18 +91,61 @@ def _make_rich_text_inline(text: str) -> List[dict]:
 
 
 # ---- Markdown Block 转换 ----
+def _is_ordered_list_item(line: str) -> bool:
+    """判断是否是有序列表项（以 数字.  开头）"""
+    stripped = line.strip()
+    return bool(re.match(r'^\d+\.\s', stripped))
+
+
 def _is_unordered_list_item(line: str) -> bool:
-    """判断是否是无序列表项（以 - 或 * 开头）"""
+    """判断是否是无序列表项（以 - 或 * 开头，后跟空格）"""
     stripped = line.strip()
     return len(stripped) >= 2 and stripped[0] in ('-', '*') and stripped[1] == ' '
 
 
+def _is_any_list_item(line: str) -> bool:
+    """判断是否是任意类型的列表项"""
+    return _is_ordered_list_item(line) or _is_unordered_list_item(line)
+
+
+def _get_indent_level(line: str) -> int:
+    """返回行的缩进级别（每 2 个空格算一级）"""
+    spaces = len(line) - len(line.lstrip(' '))
+
+
+def _get_indent_level(line: str) -> int:
+    """返回行的缩进级别（每 2 个空格算一级）"""
+    spaces = len(line) - len(line.lstrip(' '))
+    return spaces // 2
+
+
 def _strip_list_prefix(line: str) -> str:
-    """去掉列表前缀 `- ` 或 `* `"""
+    """去掉列表前缀（`1. `, `- `, `* ` 等），并清理后续多余空格"""
     stripped = line.strip()
+    # 有序列表: 1. text
+    m = re.match(r'^\d+\.\s+(.*)', stripped)
+    if m:
+        return m.group(1)
+    # 无序列表: - text 或 * text
     if len(stripped) >= 2 and stripped[0] in ('-', '*') and stripped[1] == ' ':
-        return stripped[2:]
+        return stripped[2:].lstrip()
     return stripped
+
+
+def _is_table_row(line: str) -> bool:
+    """判断是否是 Markdown 表格行（包含 | 分隔符）"""
+    s = line.strip()
+    return s.startswith('|') and '|' in s[1:]
+
+
+def _is_table_separator(line: str) -> bool:
+    """判断是否是表格分隔行 `|:---|:---|`"""
+    s = line.strip()
+    if not (s.startswith('|') and s.endswith('|')):
+        return False
+    # 分隔行只包含 |, -, :, 空格
+    inner = s[1:-1]
+    return bool(re.match(r'^[\s\-:|]+$', inner))
 
 
 def _make_image_block(image_url: str) -> dict:
@@ -209,178 +252,267 @@ class NotionPublisher:
     def _md_to_blocks(self, md_text: str, raw_base: str) -> List[dict]:
         """
         将 Markdown 文本转换为 Notion block 数组。
+        支持：标题(h1-h4)、段落、粗体/斜体/行内代码、无序列表（嵌套）、
+              代码块、表格（渲染为代码块）、分隔线、图片、引用。
 
         Args:
             md_text: Markdown 原文
-            raw_base: GitHub raw URL 前缀，用于替换本地图片路径
+            raw_base: GitHub raw URL 前缀
         """
         lines = md_text.split('\n')
         blocks: List[dict] = []
-        i = 0
 
-        # 收集连续的列表项，组装成一个 bulleted_list_item block
-        pending_list_items: List[str] = []
+        # ---- 嵌套列表处理器 ----
+        # 每个元素: {"indent": int, "node": dict}
+        # node 是 Notion bulleted_list_item block dict（含 children）
+        flat_list_nodes: List[dict] = []  # [(indent, block_dict)]
+
+        def _make_list_block(text: str, ordered: bool = False) -> dict:
+            block_type = "numbered_list_item" if ordered else "bulleted_list_item"
+            return {
+                "object": "block",
+                "type": block_type,
+                block_type: {
+                    "rich_text": _make_rich_text_inline(text),
+                },
+            }
+
+        # Notion API 限制：bulleted_list_item 最多嵌套 2 层
+        MAX_LIST_NEST_DEPTH = 2
+
+        def _nest_list_nodes(nodes: List[dict]) -> List[dict]:
+            """
+            将扁平列表节点按缩进层级嵌套为 Notion children 结构。
+            Notion API 限制最多 2 层嵌套（root → child → grandchild），
+            超出部分会被提升为上级兄弟节点。
+
+            nodes: [{"indent": int, "node": dict}, ...]
+            返回: 顶层 block 列表（含嵌套 children）
+            """
+            if not nodes:
+                return []
+
+            result: List[dict] = []
+            stack: List[Tuple[int, dict]] = []
+
+            for item in nodes:
+                indent = item["indent"]
+                node = item["node"]
+
+                # 限制缩进深度：超过 MAX_LIST_NEST_DEPTH 的提升
+                capped_indent = min(indent, MAX_LIST_NEST_DEPTH)
+
+                if not stack:
+                    result.append(node)
+                    stack.append((capped_indent, node))
+                    continue
+
+                # 找到合适的父级
+                while stack and stack[-1][0] >= capped_indent:
+                    stack.pop()
+
+                if stack:
+                    parent = stack[-1][1]
+                    # 获取父级 block 的内部 dict（支持两种列表类型）
+                    parent_type = parent.get("type", "")
+                    parent_block = parent.get(parent_type, parent)
+                    if "children" not in parent_block:
+                        parent_block["children"] = []
+                    parent_block["children"].append(node)
+                else:
+                    result.append(node)
+
+                stack.append((capped_indent, node))
+
+            return result
+
+        # ---- 状态变量 ----
+        i = 0
+        pending_paragraph: List[str] = []
+        pending_table_rows: List[str] = []
 
         def flush_list():
-            """将收集的列表项作为 bulleted_list_item 写入"""
-            nonlocal pending_list_items
-            if not pending_list_items:
-                return
-            for item_text in pending_list_items:
-                blocks.append({
-                    "object": "block",
-                    "type": "bulleted_list_item",
-                    "bulleted_list_item": {
-                        "rich_text": _make_rich_text_inline(item_text),
-                    },
-                })
-            pending_list_items = []
-
-        # 收集连续的非空段落文本，合并为一个 paragraph
-        pending_paragraph: List[str] = []
+            """将收集的扁平列表节点嵌套后写入 blocks"""
+            nonlocal flat_list_nodes
+            if flat_list_nodes:
+                nested = _nest_list_nodes(flat_list_nodes)
+                blocks.extend(nested)
+                flat_list_nodes = []
 
         def flush_paragraph():
-            """将收集的段落行合并写入"""
             nonlocal pending_paragraph
-            if not pending_paragraph:
-                return
-            combined = '\n'.join(pending_paragraph).strip()
-            if combined:
+            if pending_paragraph:
+                combined = '\n'.join(pending_paragraph).strip()
+                if combined:
+                    blocks.append({
+                        "object": "block",
+                        "type": "paragraph",
+                        "paragraph": {
+                            "rich_text": _make_rich_text_inline(combined),
+                        },
+                    })
+                pending_paragraph = []
+
+        def flush_table():
+            """将收集的表格行渲染为 code block"""
+            nonlocal pending_table_rows
+            if pending_table_rows:
+                table_text = '\n'.join(pending_table_rows)
                 blocks.append({
                     "object": "block",
-                    "type": "paragraph",
-                    "paragraph": {
-                        "rich_text": _make_rich_text_inline(combined),
+                    "type": "code",
+                    "code": {
+                        "language": "plain text",
+                        "rich_text": [{"type": "text", "text": {"content": table_text}}],
                     },
                 })
-            pending_paragraph = []
+                pending_table_rows = []
 
         while i < len(lines):
             line = lines[i]
             stripped = line.strip()
 
-            # 空行：结束当前列表或段落
+            # ---- 空行 ----
             if not stripped:
                 flush_list()
                 flush_paragraph()
+                flush_table()
                 i += 1
                 continue
 
-            # 一级标题
+            # ---- 表格行 ----
+            if _is_table_row(stripped):
+                flush_list()
+                flush_paragraph()
+                pending_table_rows.append(stripped)
+                i += 1
+                continue
+            elif _is_table_separator(stripped):
+                # 跳过分隔行，但继续收集中（不中断表格）
+                i += 1
+                continue
+            elif pending_table_rows:
+                # 上一行是表格，当前不是 → 表格结束
+                flush_table()
+
+            # ---- 一级标题 ----
             if stripped.startswith('# ') and not stripped.startswith('## '):
                 flush_list()
                 flush_paragraph()
-                content = stripped[2:]
                 blocks.append({
-                    "object": "block",
-                    "type": "heading_1",
-                    "heading_1": {"rich_text": _make_rich_text(content)},
+                    "object": "block", "type": "heading_1",
+                    "heading_1": {"rich_text": _make_rich_text(stripped[2:])},
                 })
                 i += 1
                 continue
 
-            # 二级标题
+            # ---- 二级标题 ----
             if stripped.startswith('## ') and not stripped.startswith('### '):
                 flush_list()
                 flush_paragraph()
-                content = stripped[3:]
                 blocks.append({
-                    "object": "block",
-                    "type": "heading_2",
-                    "heading_2": {"rich_text": _make_rich_text(content)},
+                    "object": "block", "type": "heading_2",
+                    "heading_2": {"rich_text": _make_rich_text(stripped[3:])},
                 })
                 i += 1
                 continue
 
-            # 三级标题
-            if stripped.startswith('### '):
+            # ---- 三级标题 ----
+            if stripped.startswith('### ') and not stripped.startswith('#### '):
                 flush_list()
                 flush_paragraph()
-                content = stripped[4:]
                 blocks.append({
-                    "object": "block",
-                    "type": "heading_3",
-                    "heading_3": {"rich_text": _make_rich_text(content)},
+                    "object": "block", "type": "heading_3",
+                    "heading_3": {"rich_text": _make_rich_text(stripped[4:])},
                 })
                 i += 1
                 continue
 
-            # 代码块
+            # ---- 四级标题（Notion 无 h4，映射为 h3） ----
+            if stripped.startswith('#### '):
+                flush_list()
+                flush_paragraph()
+                blocks.append({
+                    "object": "block", "type": "heading_3",
+                    "heading_3": {"rich_text": _make_rich_text(stripped[5:])},
+                })
+                i += 1
+                continue
+
+            # ---- 代码块 ----
             if _is_code_fence(stripped):
                 flush_list()
                 flush_paragraph()
-                i += 1  # 跳过 ```
+                i += 1
                 code_lines: List[str] = []
                 lang = stripped[3:].strip() or "plain text"
                 while i < len(lines) and not _is_code_fence(lines[i]):
                     code_lines.append(lines[i])
                     i += 1
-                i += 1  # 跳过结尾 ```
-                code_content = '\n'.join(code_lines)
+                i += 1
                 blocks.append({
-                    "object": "block",
-                    "type": "code",
+                    "object": "block", "type": "code",
                     "code": {
                         "language": lang,
-                        "rich_text": _make_rich_text(code_content),
+                        "rich_text": _make_rich_text('\n'.join(code_lines)),
                     },
                 })
                 continue
 
-            # 分隔线
+            # ---- 分隔线 ----
             if _is_divider(stripped):
                 flush_list()
                 flush_paragraph()
-                blocks.append({
-                    "object": "block",
-                    "type": "divider",
-                    "divider": {},
-                })
+                blocks.append({"object": "block", "type": "divider", "divider": {}})
                 i += 1
                 continue
 
-            # 图片
+            # ---- 图片 ----
             if stripped.startswith('!['):
                 flush_list()
                 flush_paragraph()
-                # 格式: ![alt](path)
                 img_match = re.match(r'!\[.*?\]\((.+?)\)', stripped)
                 if img_match:
-                    local_path = img_match.group(1)
-                    image_url = self._resolve_image_url(local_path, raw_base)
-                    blocks.append(_make_image_block(image_url))
+                    blocks.append(_make_image_block(
+                        self._resolve_image_url(img_match.group(1), raw_base)))
                 i += 1
                 continue
 
-            # 列表项
-            if _is_unordered_list_item(stripped):
-                flush_paragraph()  # 先结束段落
-                item_text = _strip_list_prefix(stripped)
-                pending_list_items.append(item_text)
-                i += 1
-                continue
-
-            # 引用块（> 开头）
-            if stripped.startswith('> '):
-                flush_list()
+            # ---- 列表项（支持有序/无序、嵌套缩进） ----
+            if _is_any_list_item(stripped):
                 flush_paragraph()
-                content = stripped[2:]
-                blocks.append({
-                    "object": "block",
-                    "type": "quote",
-                    "quote": {"rich_text": _make_rich_text_inline(content)},
+                item_text = _strip_list_prefix(stripped)
+                is_ordered = _is_ordered_list_item(stripped)
+
+                line_indent = _get_indent_level(line)
+
+                flat_list_nodes.append({
+                    "indent": line_indent,
+                    "node": _make_list_block(item_text, ordered=is_ordered),
                 })
                 i += 1
                 continue
 
-            # 普通文本（段落）
+            # ---- 引用块（> 开头） ----
+            if stripped.startswith('> '):
+                flush_list()
+                flush_paragraph()
+                blocks.append({
+                    "object": "block", "type": "quote",
+                    "quote": {"rich_text": _make_rich_text_inline(stripped[2:])},
+                })
+                i += 1
+                continue
+
+            # ---- 普通文本（段落） ----
             flush_list()
             pending_paragraph.append(stripped)
             i += 1
 
-        # 收尾：flush 残留的列表和段落
+        # 收尾
         flush_list()
         flush_paragraph()
+        flush_table()
 
         # 清理空段落
         blocks = [b for b in blocks if b.get("type") != "paragraph"
