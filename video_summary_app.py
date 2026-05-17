@@ -1297,10 +1297,10 @@ class VideoSummaryApp:
                 "请先执行: git remote add origin <仓库地址>")
             return
 
-        # 暂存所有 .md 和截图文件（排除 downloads 等大文件）
+        # 暂存所有变更（排除 downloads 等大文件由 .gitignore 控制）
         logger.info("  📝 暂存笔记文件...")
         subprocess.run(
-            ['git', 'add', '*.md', '*_frames/'],
+            ['git', 'add', '-A'],
             cwd=self.output_dir, capture_output=True)
 
         # 提交（可能没有变更，允许失败）
@@ -1381,12 +1381,24 @@ class VideoSummaryApp:
         try:
             publisher = NotionPublisher(
                 token=notion_token, parent_page_id=notion_page_id)
+
+            # 从 md 路径推导仓库子目录（如 md 在 output/CS149/ 下 → "CS149/"）
+            repo_subdir = ""
+            try:
+                rel_path = os.path.relpath(md_path, self.output_dir)
+                parts = rel_path.replace(os.sep, '/').split('/')
+                if len(parts) > 1:
+                    repo_subdir = parts[0] + "/"
+            except ValueError:
+                pass
+
             page_url = publisher.push_markdown(
                 md_path=md_path,
                 title=video_title,
                 github_user=github_user,
                 github_repo=github_repo,
                 github_branch=github_branch,
+                repo_subdir=repo_subdir,
             )
             if page_url:
                 logger.info(f"  ✅ Notion 推送成功: {page_url}")
