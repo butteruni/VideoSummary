@@ -171,6 +171,42 @@ def _is_code_fence(line: str) -> bool:
     return line.strip().startswith('```')
 
 
+# Notion 支持的代码语言白名单 + 常见别名映射
+_CODE_LANG_MAP = {
+    "text": "plain text", "plaintext": "plain text", "txt": "plain text",
+    "cpp": "c++", "cplusplus": "c++", "cc": "c++", "cxx": "c++",
+    "csharp": "c#", "cs": "c#",
+    "js": "javascript", "ts": "typescript",
+    "py": "python", "rb": "ruby",
+    "sh": "shell", "bash": "shell", "zsh": "shell",
+    "yml": "yaml",
+    "md": "markdown", "mkd": "markdown",
+    "ps1": "powershell", "pwsh": "powershell",
+    "pseudocode": "plain text", "plpgsql": "sql",
+    "math": "plain text", "latex": "latex",
+    "": "plain text",
+}
+
+
+def _normalize_code_lang(raw_lang: str) -> str:
+    """将 Markdown 代码块语言标识标准化为 Notion 接受的格式"""
+    normalized = raw_lang.strip().lower()
+    return _CODE_LANG_MAP.get(normalized, normalized)
+
+
+def _chunk_long_text(content: str, max_len: int = 1990) -> List[dict]:
+    """将超长文本拆分为多个 rich_text 元素（Notion 限制 ≤2000 字符，留 10 字节余量）"""
+    if len(content) <= max_len:
+        return [{"type": "text", "text": {"content": content}}]
+    chunks = []
+    pos = 0
+    while pos < len(content):
+        chunk = content[pos:pos + max_len]
+        chunks.append({"type": "text", "text": {"content": chunk}})
+        pos += len(chunk)  # 用实际长度推进，避免边界偏差
+    return chunks
+
+
 # ---- NotionPublisher ----
 class NotionPublisher:
     """
@@ -495,16 +531,18 @@ class NotionPublisher:
                 flush_paragraph()
                 i += 1
                 code_lines: List[str] = []
-                lang = stripped[3:].strip() or "plain text"
+                raw_lang = stripped[3:].strip()
+                lang = _normalize_code_lang(raw_lang)
                 while i < len(lines) and not _is_code_fence(lines[i]):
                     code_lines.append(lines[i])
                     i += 1
                 i += 1
+                code_content = '\n'.join(code_lines)
                 blocks.append({
                     "object": "block", "type": "code",
                     "code": {
                         "language": lang,
-                        "rich_text": _make_rich_text('\n'.join(code_lines)),
+                        "rich_text": _chunk_long_text(code_content),
                     },
                 })
                 continue
