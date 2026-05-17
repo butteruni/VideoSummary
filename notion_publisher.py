@@ -183,14 +183,16 @@ _CODE_LANG_MAP = {
     "md": "markdown", "mkd": "markdown",
     "ps1": "powershell", "pwsh": "powershell",
     "pseudocode": "plain text", "plpgsql": "sql",
+    "pseudo": "plain text",
     "math": "plain text", "latex": "latex",
+    "cuda": "plain text",
     "": "plain text",
 }
 
 
 def _normalize_code_lang(raw_lang: str) -> str:
     """将 Markdown 代码块语言标识标准化为 Notion 接受的格式"""
-    normalized = raw_lang.strip().lower()
+    normalized = raw_lang.strip().lower().strip('`').strip()
     return _CODE_LANG_MAP.get(normalized, normalized)
 
 
@@ -242,6 +244,7 @@ class NotionPublisher:
         github_user: str,
         github_repo: str,
         github_branch: str = "main",
+        repo_subdir: str = "",
     ) -> Optional[str]:
         """
         读取 Markdown 文件，转换为 Notion blocks 并创建页面。
@@ -252,6 +255,7 @@ class NotionPublisher:
             github_user: GitHub 用户名
             github_repo: GitHub 仓库名
             github_branch: 分支名
+            repo_subdir: 仓库子目录（如 "CS149/"），用于修正图片 URL 路径
 
         Returns:
             创建的 Notion 页面 URL，失败返回 None
@@ -269,7 +273,7 @@ class NotionPublisher:
         raw_base = f"https://raw.githubusercontent.com/{github_user}/{github_repo}/{github_branch}"
 
         # 转换 Markdown → Notion blocks
-        blocks = self._md_to_blocks(md_text, raw_base)
+        blocks = self._md_to_blocks(md_text, raw_base, repo_subdir)
         logger.info(f"  转换完成: {len(blocks)} 个 Notion blocks")
 
         if not blocks:
@@ -285,7 +289,8 @@ class NotionPublisher:
             logger.error(f"❌ 推送 Notion 失败: {e}")
             return None
 
-    def _md_to_blocks(self, md_text: str, raw_base: str) -> List[dict]:
+    def _md_to_blocks(self, md_text: str, raw_base: str,
+                       repo_subdir: str = "") -> List[dict]:
         """
         将 Markdown 文本转换为 Notion block 数组。
         支持：标题(h1-h4)、段落、粗体/斜体/行内代码、无序列表（嵌套）、
@@ -562,7 +567,7 @@ class NotionPublisher:
                 img_match = re.match(r'!\[.*?\]\((.+?)\)', stripped)
                 if img_match:
                     blocks.append(_make_image_block(
-                        self._resolve_image_url(img_match.group(1), raw_base)))
+                        self._resolve_image_url(img_match.group(1), raw_base, repo_subdir)))
                 i += 1
                 continue
 
@@ -610,22 +615,25 @@ class NotionPublisher:
 
         return blocks
 
-    def _resolve_image_url(self, local_path: str, raw_base: str) -> str:
+    def _resolve_image_url(self, local_path: str, raw_base: str,
+                           repo_subdir: str = "") -> str:
         """
         将本地相对路径转为 GitHub raw URL。
 
         Args:
             local_path: Markdown 中的相对路径，如 "xxx_frames/chunk_01/img.jpg"
             raw_base: GitHub raw URL 前缀
-
-        Returns:
-            完整的公网 URL
+            repo_subdir: 仓库子目录前缀（如 "CS149/"）
         """
         # URL encode 路径中的特殊字符（中文、空格等）
         encoded_path = url_quote(local_path, safe='/')
         # 去掉可能的 ./ 前缀
         if encoded_path.startswith('./'):
             encoded_path = encoded_path[2:]
+
+        # 仓库子目录前缀
+        if repo_subdir:
+            encoded_path = f"{repo_subdir.rstrip('/')}/{encoded_path}"
 
         return f"{raw_base}/{encoded_path}"
 
