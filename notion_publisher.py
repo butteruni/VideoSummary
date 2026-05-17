@@ -353,20 +353,67 @@ class NotionPublisher:
                     })
                 pending_paragraph = []
 
+        def _parse_table_cells(row_text: str) -> List[str]:
+            """解析表格行 `| cell1 | cell2 |` 为单元格列表"""
+            # 去掉首尾的 |，按 | 分割
+            inner = row_text.strip()
+            if inner.startswith('|'):
+                inner = inner[1:]
+            if inner.endswith('|'):
+                inner = inner[:-1]
+            return [c.strip() for c in inner.split('|')]
+
         def flush_table():
-            """将收集的表格行渲染为 code block"""
+            """将收集的表格行转换为 Notion table block"""
             nonlocal pending_table_rows
-            if pending_table_rows:
-                table_text = '\n'.join(pending_table_rows)
-                blocks.append({
-                    "object": "block",
-                    "type": "code",
-                    "code": {
-                        "language": "plain text",
-                        "rich_text": [{"type": "text", "text": {"content": table_text}}],
-                    },
-                })
+            if not pending_table_rows:
+                return
+
+            # 过滤掉分隔行（只含 | - : 空格）
+            data_rows = [r for r in pending_table_rows if not _is_table_separator(r)]
+            if not data_rows:
                 pending_table_rows = []
+                return
+
+            # 解析所有行
+            parsed = [_parse_table_cells(r) for r in data_rows]
+            if not parsed:
+                pending_table_rows = []
+                return
+
+            # 列数：取最长的行
+            col_count = max(len(row) for row in parsed)
+
+            # 第一行作为表头
+            has_header = len(parsed) >= 2
+
+            # 构建 table_row children
+            table_children = []
+            for row_cells in parsed:
+                # 补齐到 col_count 列
+                while len(row_cells) < col_count:
+                    row_cells.append("")
+
+                cells = []
+                for cell_text in row_cells[:col_count]:
+                    cells.append(_make_rich_text_inline(cell_text))
+                table_children.append({
+                    "type": "table_row",
+                    "table_row": {"cells": cells},
+                })
+
+            table_block = {
+                "object": "block",
+                "type": "table",
+                "table": {
+                    "table_width": col_count,
+                    "has_column_header": has_header,
+                    "has_row_header": False,
+                    "children": table_children,
+                },
+            }
+            blocks.append(table_block)
+            pending_table_rows = []
 
         while i < len(lines):
             line = lines[i]
@@ -380,15 +427,18 @@ class NotionPublisher:
                 i += 1
                 continue
 
-            # ---- 表格行 ----
-            if _is_table_row(stripped):
+            # ---- 表格行（先检查分隔行，再检查数据行） ----
+            if _is_table_separator(stripped):
+                # 收集中间可能出现的分隔行（用于后续解析时跳过）
                 flush_list()
                 flush_paragraph()
                 pending_table_rows.append(stripped)
                 i += 1
                 continue
-            elif _is_table_separator(stripped):
-                # 跳过分隔行，但继续收集中（不中断表格）
+            elif _is_table_row(stripped):
+                flush_list()
+                flush_paragraph()
+                pending_table_rows.append(stripped)
                 i += 1
                 continue
             elif pending_table_rows:
