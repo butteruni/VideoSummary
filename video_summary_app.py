@@ -327,21 +327,24 @@ logger = logging.getLogger(__name__)
 class VideoDownloader:
     """视频和字幕下载器（使用yt-dlp）"""
 
-    def __init__(self, output_dir: str = "downloads", cookies_file: str = None):
+    def __init__(self, output_dir: str = "downloads", cookies_file: str = None,
+                 cookies_from_browser: str = None):
         """
         初始化下载器
 
         Args:
             output_dir: 下载文件保存目录
             cookies_file: Cookies 文件路径（用于 Bilibili 等需要登录的网站）
+            cookies_from_browser: 从浏览器读取 cookies（chrome/firefox/edge 等）
         """
         self.output_dir = output_dir
         self.cookies_file = cookies_file
+        self.cookies_from_browser = cookies_from_browser
         os.makedirs(output_dir, exist_ok=True)
 
     def _build_ytdlp_command(self, base_args: List[str]) -> List[str]:
         """
-        构建 yt-dlp 命令，自动添加 cookies 参数（如果提供）
+        构建 yt-dlp 命令，自动添加 cookies 参数
 
         Args:
             base_args: yt-dlp 的基础参数列表（不包含 'yt-dlp'）
@@ -350,7 +353,10 @@ class VideoDownloader:
             完整的命令列表
         """
         cmd = ['yt-dlp']
-        if self.cookies_file:
+        if self.cookies_from_browser:
+            cmd.extend(['--cookies-from-browser', self.cookies_from_browser])
+            logger.info(f"🍪 使用浏览器 cookies: {self.cookies_from_browser}")
+        elif self.cookies_file:
             if os.path.exists(self.cookies_file):
                 cmd.extend(['--cookies', self.cookies_file])
                 logger.info(f"🍪 使用 cookies 文件: {self.cookies_file}")
@@ -1030,8 +1036,15 @@ class TimeRangeExtractor:
 class VideoSummaryApp:
     """视频总结应用主类"""
 
+    # 需要登录的网站域名关键词
+    AUTH_SITES = {
+        'bilibili.com': 'https://www.bilibili.com/',
+        'youtube.com': 'https://www.youtube.com/',
+    }
+
     def __init__(self, output_dir: str = "output", test_mode: bool = False,
                  text_only: bool = False, cookies_file: str = None,
+                 cookies_from_browser: str = None, auto_login: bool = False,
                  push_to_github: bool = False,
                  push_to_notion: bool = False):
         """
@@ -1042,18 +1055,63 @@ class VideoSummaryApp:
             test_mode: 是否启用测试模式（不调用LLM，仅输出Prompt）
             text_only: Non video模式，仅生成文本总结
             cookies_file: Cookies 文件路径（用于 Bilibili 等需要登录的网站）
+            cookies_from_browser: 从浏览器读取 cookies（chrome/firefox/edge/brave 等）
+            auto_login: 检测到需要登录时自动打开浏览器
             push_to_github: 处理完成后是否自动 git push
             push_to_notion: 处理完成后是否自动推送到 Notion
         """
         self.output_dir = output_dir
         os.makedirs(output_dir, exist_ok=True)
+        self.auto_login = auto_login
+        self.cookies_from_browser = cookies_from_browser
         self.downloader = VideoDownloader(
-            os.path.join(output_dir, "downloads"), cookies_file=cookies_file)
+            os.path.join(output_dir, "downloads"),
+            cookies_file=cookies_file,
+            cookies_from_browser=cookies_from_browser)
         self.time_extractor = TimeRangeExtractor()
         self.test_mode = test_mode
         self.text_only = text_only
         self.push_to_github = push_to_github
         self.push_to_notion = push_to_notion
+
+    def _detect_site(self, url: str) -> str:
+        """检测 URL 对应的网站类型"""
+        url_lower = url.lower()
+        for domain in self.AUTH_SITES:
+            if domain in url_lower:
+                return domain
+        return ''
+
+    def _open_browser_for_login(self, site: str) -> bool:
+        """
+        打开浏览器让用户登录目标网站。
+        登录完成后提示用户按 Enter 继续。
+
+        Returns:
+            True 如果浏览器打开成功
+        """
+        import webbrowser
+
+        if site not in self.AUTH_SITES:
+            logger.warning(f"  未知网站 {site}，跳过自动登录")
+            return False
+
+        login_url = self.AUTH_SITES[site]
+        logger.info(f"\n{'='*60}")
+        logger.info(f"🔓 检测到需要登录 {site}")
+        logger.info(f"   正在打开浏览器: {login_url}")
+        logger.info(f"   请在浏览器中完成登录后，回到此处按 Enter 继续")
+        logger.info(f"{'='*60}")
+
+        try:
+            webbrowser.open(login_url)
+        except Exception as e:
+            logger.warning(f"  无法自动打开浏览器: {e}")
+            logger.info(f"   请手动打开 {login_url} 登录")
+            return False
+
+        input("\n登录完成后按 Enter 继续...")
+        return True
 
     def process_video(self, url: Optional[str] = None,
                       frame_extraction_interval: float = 2.0,
@@ -1111,6 +1169,31 @@ class VideoSummaryApp:
         if not subtitle_path:
             if not url:
                 raise ValueError("未提供视频链接或字幕文件，无法继续")
+
+            # 自动登录：检测到 B站/YouTube 且未提供 cookies 时打开浏览器
+            if self.auto_login and url:
+                site = self._detect_site(url)
+                if site and not self.cookies_from_browser:
+                    # 尝试常见浏览器（Windows 优先 edge/chrome）
+                    browser_candidates = ['msedge', 'chrome', 'firefox']
+                    for browser in browser_candidates:
+                        try:
+                            subprocess.run(
+                                [browser, '--version'],
+                                capture_output=True, timeout=5)
+                            self.cookies_from_browser = browser
+                            self.downloader.cookies_from_browser = browser
+                            logger.info(
+                                f"🍪 检测到浏览器: {browser}，将使用其 cookies")
+                            break
+                        except Exception:
+                            continue
+                    if not self.cookies_from_browser:
+                        logger.warning(
+                            "  未检测到已安装的浏览器，将不使用 cookies")
+                if site and self.cookies_from_browser:
+                    self._open_browser_for_login(site)
+
             need_video_download = (
                 not self.text_only and video_path is None
             )
@@ -2058,6 +2141,12 @@ def main():
         '-c', '--cookies', type=str, default=None,
         help='Cookies 文件路径（用于 Bilibili 等需要登录的网站），例如: --cookies cookies.txt')
     parser.add_argument(
+        '--cookies-from-browser', type=str, default=None,
+        help='从浏览器读取 cookies（chrome/firefox/edge/brave 等），优先于 --cookies')
+    parser.add_argument(
+        '--login', action='store_true',
+        help='自动检测需要登录的网站并打开浏览器，登录后使用浏览器 cookies')
+    parser.add_argument(
         '--push', action='store_true',
         help='处理完成后自动 git push 到远程仓库（需先在 output 目录配置 git remote）')
     parser.add_argument(
@@ -2091,6 +2180,8 @@ def main():
                               test_mode=args.test,
                               text_only=args.text_only,
                               cookies_file=cookies_file,
+                              cookies_from_browser=args.cookies_from_browser,
+                              auto_login=args.login,
                               push_to_github=args.push,
                               push_to_notion=args.notion)
         result_path = app.process_video(
