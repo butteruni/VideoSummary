@@ -1143,6 +1143,15 @@ class VideoSummaryApp:
             logger.info(f"   请手动打开 {login_url} 登录")
             return False
 
+        # 非交互环境跳过等待（用户需自行关闭浏览器后重试）
+        if not sys.stdin.isatty():
+            logger.info("   （非交互环境，跳过等待。）")
+            logger.info(
+                "   👉 请在浏览器中登录后关闭浏览器，然后运行：")
+            logger.info(
+                f"   python video_summary_app.py <url> --cookies-from-browser {self.cookies_from_browser}")
+            return False
+
         input("\n登录完成后按 Enter 继续...")
         return True
 
