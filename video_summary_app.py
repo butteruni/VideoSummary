@@ -1336,8 +1336,13 @@ class VideoSummaryApp:
                 summary_path = summary_future.result()
                 chunk_frames = frames_future.result()
 
-        # 5. 生成最终markdown
-        logger.info("\n[步骤 5/5] 生成最终markdown文档...")
+        # 5. LLM 合并去重 temp summary（无帧，不会被 LLM 丢弃）
+        if not self.test_mode:
+            logger.info("\n[步骤 5/6] LLM 智能整理笔记...")
+            summary_path = self._consolidate_markdown(summary_path)
+
+        # 6. 生成最终markdown（帧追加到合并后的笔记末尾）
+        logger.info("\n[步骤 6/6] 生成最终markdown文档...")
         # 获取原始文件名（用于输出文件名和标题）
         # provided_title 优先；否则从文件路径推断
         if provided_title:
@@ -1354,10 +1359,6 @@ class VideoSummaryApp:
         final_md_path = self._generate_final_markdown(
             summary_path, chunk_texts, chunk_frames, video_title, video_path, original_filename
         )
-
-        # LLM 智能整理笔记（合并去重 + 重组章节）
-        if not self.test_mode:
-            final_md_path = self._consolidate_markdown(final_md_path)
 
         # 清理中间产物
         self._cleanup_temp_files([temp_text_file, summary_path])
@@ -1917,8 +1918,18 @@ class VideoSummaryApp:
 
                     f.write("\n\n---\n\n")
             else:
-                # 如果无法分割，直接写入整个内容
+                # 无法按 "## 第 N 部分" 分割 —— 说明是 LLM 合并后的干净笔记
+                # 原因：_consolidate_markdown 已将 temp summary 重组为逻辑章节
                 f.write(summary_content)
+
+                # 将所有帧追加到文末
+                if chunk_frames:
+                    all_frames = []
+                    for idx in sorted(chunk_frames.keys()):
+                        all_frames.extend(chunk_frames[idx])
+                    if all_frames:
+                        f.write("\n\n---\n\n## 关键截图\n\n")
+                        self._write_frame_block(f, all_frames, final_md_path)
 
         return final_md_path
 
