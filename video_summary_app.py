@@ -1920,16 +1920,57 @@ class VideoSummaryApp:
             else:
                 # 无法按 "## 第 N 部分" 分割 —— 说明是 LLM 合并后的干净笔记
                 # 原因：_consolidate_markdown 已将 temp summary 重组为逻辑章节
-                f.write(summary_content)
-
-                # 将所有帧追加到文末
-                if chunk_frames:
+                # 策略：按章节均分截图，穿插到各章节之间
+                if not chunk_frames:
+                    f.write(summary_content)
+                else:
                     all_frames = []
                     for idx in sorted(chunk_frames.keys()):
                         all_frames.extend(chunk_frames[idx])
-                    if all_frames:
-                        f.write("\n\n---\n\n## 关键截图\n\n")
-                        self._write_frame_block(f, all_frames, final_md_path)
+
+                    # 按 "## 一、" "## 二、" 等逻辑章节切分
+                    sections = re.split(
+                        r'(\n## [一二三四五六七八九十]+、[^\n]*\n)', summary_content)
+
+                    if len(sections) > 1 and all_frames:
+                        # sections[0] = 标题区，sections[1]=## 一、.., sections[2]=内容...
+                        # 有效章节数 = (len(sections)-1)/2
+                        content_sections = []
+                        for i in range(1, len(sections), 2):
+                            header = sections[i]
+                            body = sections[i+1] if i+1 < len(sections) else ''
+                            content_sections.append((header, body))
+
+                        num_sections = len(content_sections)
+                        frames_per_section = max(
+                            1, len(all_frames) // num_sections)
+                        extra = len(all_frames) - \
+                            frames_per_section * num_sections
+
+                        # 写标题区
+                        f.write(sections[0])
+
+                        frame_cursor = 0
+                        for sec_idx, (header, body) in enumerate(content_sections):
+                            f.write(header)
+                            f.write(body)
+
+                            # 截图穿插在章节之间（末尾章节多分余数帧）
+                            count = frames_per_section + \
+                                (1 if sec_idx >= num_sections - extra else 0)
+                            if count > 0 and frame_cursor < len(all_frames):
+                                batch = all_frames[frame_cursor:frame_cursor+count]
+                                frame_cursor += count
+                                f.write("\n")
+                                self._write_frame_block(
+                                    f, batch, final_md_path)
+                    else:
+                        # 无法切分章节，退回末尾追加
+                        f.write(summary_content)
+                        if all_frames:
+                            f.write("\n\n---\n\n## 关键截图\n\n")
+                            self._write_frame_block(
+                                f, all_frames, final_md_path)
 
         return final_md_path
 
