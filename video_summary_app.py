@@ -1074,6 +1074,37 @@ class VideoSummaryApp:
         self.push_to_github = push_to_github
         self.push_to_notion = push_to_notion
 
+    def _detect_browser(self) -> Optional[str]:
+        """检测系统可用的浏览器，返回 yt-dlp 兼容的浏览器标识符"""
+        import shutil
+
+        # yt-dlp 浏览器标识符 → (可执行文件名, Windows 常见路径)
+        browsers = [
+            ('edge', 'msedge', [
+                r'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe',
+                r'C:\Program Files\Microsoft\Edge\Application\msedge.exe',
+            ]),
+            ('chrome', 'chrome', [
+                r'C:\Program Files\Google\Chrome\Application\chrome.exe',
+                r'C:\Program Files (x86)\Google\Chrome\Application\chrome.exe',
+            ]),
+            ('firefox', 'firefox', [
+                r'C:\Program Files\Mozilla Firefox\firefox.exe',
+                r'C:\Program Files (x86)\Mozilla Firefox\firefox.exe',
+            ]),
+        ]
+
+        for ytdlp_name, exe_name, paths in browsers:
+            # 1) 先尝试 PATH
+            if shutil.which(exe_name):
+                return ytdlp_name
+            # 2) 再检查常见路径
+            for p in paths:
+                if os.path.exists(p):
+                    return ytdlp_name
+
+        return None
+
     def _detect_site(self, url: str) -> str:
         """检测 URL 对应的网站类型"""
         url_lower = url.lower()
@@ -1100,7 +1131,9 @@ class VideoSummaryApp:
         logger.info(f"\n{'='*60}")
         logger.info(f"🔓 检测到需要登录 {site}")
         logger.info(f"   正在打开浏览器: {login_url}")
-        logger.info(f"   请在浏览器中完成登录后，回到此处按 Enter 继续")
+        logger.info(f"   请在浏览器中完成登录，然后**关闭浏览器**")
+        logger.info(f"   （关闭浏览器后 yt-dlp 才能读取 cookies）")
+        logger.info(f"   关闭浏览器后，回到此处按 Enter 继续")
         logger.info(f"{'='*60}")
 
         try:
@@ -1174,21 +1207,13 @@ class VideoSummaryApp:
             if self.auto_login and url:
                 site = self._detect_site(url)
                 if site and not self.cookies_from_browser:
-                    # 尝试常见浏览器（Windows 优先 edge/chrome）
-                    browser_candidates = ['msedge', 'chrome', 'firefox']
-                    for browser in browser_candidates:
-                        try:
-                            subprocess.run(
-                                [browser, '--version'],
-                                capture_output=True, timeout=5)
-                            self.cookies_from_browser = browser
-                            self.downloader.cookies_from_browser = browser
-                            logger.info(
-                                f"🍪 检测到浏览器: {browser}，将使用其 cookies")
-                            break
-                        except Exception:
-                            continue
-                    if not self.cookies_from_browser:
+                    browser = self._detect_browser()
+                    if browser:
+                        self.cookies_from_browser = browser
+                        self.downloader.cookies_from_browser = browser
+                        logger.info(
+                            f"🍪 检测到浏览器: {browser}，将使用其 cookies")
+                    else:
                         logger.warning(
                             "  未检测到已安装的浏览器，将不使用 cookies")
                 if site and self.cookies_from_browser:
