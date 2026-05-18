@@ -63,7 +63,7 @@ def chinese_char_ratio(text: str) -> float:
 # ==== LLM 配置（可根据需要修改）====
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-PRIMARY_MODEL = "deepseek-chat"
+PRIMARY_MODEL = "deepseek-v4-pro"
 BASE_SYSTEM_PROMPT = """
 ## Background Information
 
@@ -1238,6 +1238,10 @@ class VideoSummaryApp:
             summary_path, chunk_texts, chunk_frames, video_title, video_path, original_filename
         )
 
+        # 合并去重：当有多个 chunk 时，调用 LLM 合并重复内容
+        if len(chunks) > 1 and not self.test_mode:
+            final_md_path = self._consolidate_markdown(final_md_path)
+
         # 清理中间产物
         self._cleanup_temp_files([temp_text_file, summary_path])
 
@@ -1800,6 +1804,90 @@ class VideoSummaryApp:
                 f.write(summary_content)
 
         return final_md_path
+
+    def _consolidate_markdown(self, md_path: str) -> str:
+        """
+        调用 DeepSeek 合并去重最终笔记。
+        当视频被切分成多个 chunk 独立总结后，同一知识点会在不同
+        "## 第 N 部分" 中重复出现。本方法将全文发给 LLM，
+        要求合并重复内容、重组为逻辑章节，输出干净版本。
+        """
+        logger.info("\n[去重] 合并重复内容，生成干净笔记...")
+
+        # 读取原始笔记
+        with open(md_path, 'r', encoding='utf-8') as f:
+            original = f.read()
+
+        part_count = len(re.findall(r'## 第 \d+ 部分', original))
+        if part_count <= 1:
+            logger.info("  仅 1 个部分，跳过去重")
+            return md_path
+
+        original_lines = len(original.splitlines())
+
+        consolidate_prompt = """你是一名专业的技术编辑。一段课程视频被切分成多个带重叠的字幕片段，每个片段独立交给 AI 生成了笔记。因此，同一个知识点在多个"## 第 N 部分"中被反复解释（措辞不同但内容重复）。
+
+你的任务：将这些零散的笔记**合并去重**，输出一份干净、无冗余的完整笔记。
+
+## 规则
+
+1. **合并重复章节**：当同一个概念在多个"部分"中出现时，合并为一个章节。保留最完整/最清晰的解释，删除重复部分。
+2. **重组为逻辑章节**：用 `## 一、...`、`## 二、...` 等逻辑章节替代原始的 `## 第 N 部分` 标记。
+3. **添加主题摘要**：在标题后添加 `> 主题：...` 行，概括本讲的中心内容。
+4. **保留原标题**：`# 标题` 保持不变。
+5. **保留格式**：保持所有项目符号、加粗术语、表格、LaTeX 公式、代码块原样。仅删除逐字重复的内容。
+6. **精简冗长表述**：同一观点在附近多段重复时，保留最精炼的版本。
+7. **保留所有图片引用**：所有 `![截图](...)` 引用必须完整保留，不要修改、删除或移动位置。
+8. **只输出中文笔记**：最终输出为中文（与输入保持一致）。
+9. **禁止元对话**：不要输出"以下是合并后的笔记"之类的说明。直接从内容开始。
+10. **不添加新内容**：只重组和去重已有内容，不要发明新的解释或例子。
+
+直接输出合并后的干净笔记。"""
+
+        prompt = consolidate_prompt + "\n\n以下是需要合并去重的原始笔记：\n\n" + original
+
+        client = OpenAI(
+            api_key=os.environ.get("DEEPSEEK_API_KEY", DEEPSEEK_API_KEY),
+            base_url=DEEPSEEK_BASE_URL
+        )
+
+        for attempt in range(1, 6):
+            try:
+                response = client.chat.completions.create(
+                    model=PRIMARY_MODEL,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.3,
+                )
+                result = response.choices[0].message.content
+
+                if not result or not result.strip():
+                    raise RuntimeError("LLM 返回空结果")
+
+                result = result.strip()
+                new_lines = len(result.splitlines())
+                reduction = (
+                    1 - new_lines / original_lines) * 100 if original_lines > 0 else 0
+
+                logger.info(
+                    f"  去重完成: {original_lines} → {new_lines} 行 (-{reduction:.0f}%)")
+
+                # 写回文件
+                with open(md_path, 'w', encoding='utf-8') as f:
+                    f.write(result)
+                    if not result.endswith('\n'):
+                        f.write('\n')
+
+                return md_path
+
+            except Exception as e:
+                logger.warning(
+                    f"  去重第 {attempt}/5 次失败: {e}")
+                if attempt < 5:
+                    time.sleep(30)
+                else:
+                    logger.warning("  去重失败，保留原始笔记")
+
+        return md_path
 
     def _write_frame_block(self, file_obj: TextIO, frame_paths: List[str],
                            final_md_path: str) -> None:
