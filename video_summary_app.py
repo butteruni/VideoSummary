@@ -1336,10 +1336,7 @@ class VideoSummaryApp:
                 summary_path = summary_future.result()
                 chunk_frames = frames_future.result()
 
-        # 5. 生成最终markdown（帧按 chunk 精确对应）
-        logger.info("\n[步骤 5/5] 生成最终markdown文档...")
-        # 获取原始文件名（用于输出文件名和标题）
-        # provided_title 优先；否则从文件路径推断
+        # 获取原始文件名
         if provided_title:
             original_filename = video_title
         elif video_path:
@@ -1351,16 +1348,19 @@ class VideoSummaryApp:
         else:
             original_filename = video_title
 
-        final_md_path = self._generate_final_markdown(
-            summary_path, chunk_texts, chunk_frames, video_title, video_path, original_filename
-        )
+        # 5. LLM 一次性编排完整最终笔记（合并 + 去重 + 截图位置）
+        if not self.test_mode:
+            logger.info("\n[步骤 5/5] LLM 编排最终笔记...")
+            final_md_path = self._llm_compose_final(
+                summary_path, chunk_frames, original_filename)
+        else:
+            logger.info("\n[步骤 5/5] 生成最终markdown文档...")
+            final_md_path = self._generate_final_markdown(
+                summary_path, chunk_texts, chunk_frames, video_title, video_path, original_filename
+            )
 
-        # text-only 模式：无截图，可以安全合并去重
-        if self.text_only and not self.test_mode:
-            final_md_path = self._consolidate_markdown(final_md_path)
-
-        # 清理中间产物
-        self._cleanup_temp_files([temp_text_file, summary_path])
+        # 清理中间产物（保留 temp 文件供检查）
+        # self._cleanup_temp_files([temp_text_file, summary_path])
 
         # 推送到 GitHub（如果启用 --push）
         self._push_to_github()
@@ -1827,9 +1827,142 @@ class VideoSummaryApp:
 
         return chunk_frames
 
-    def _generate_final_markdown(self, summary_path: str, chunks: List[str],
-                                 chunk_frames: Dict[int, List[str]],
-                                 video_title: str, video_path: str, original_filename: str) -> str:
+    def _llm_compose_final(self, summary_path: str,
+                           chunk_frames: Dict[int, List[str]],
+                           original_filename: str) -> str:
+        """
+        将所有 chunk 摘要一次性发给 LLM，由 LLM 输出完整最终文档。
+        LLM 决定：章节结构、去重、截图位置（用 [FRAMES:chunk_N] 占位）。
+        程序只负责把占位符替换为实际图片路径。
+        """
+        import re
+
+        logger.info("\n[LLM 编排] 将所有摘要发给 LLM 生成最终笔记...")
+
+        with open(summary_path, 'r', encoding='utf-8') as f:
+            temp_content = f.read()
+
+        # 提取每个 chunk 的摘要文本
+        parts = re.split(r'\n## 第 (\d+) 部分\n', temp_content)
+        chunk_summaries = []
+        for i in range(1, len(parts), 2):
+            if i + 1 < len(parts):
+                chunk_num = int(parts[i])
+                summary = parts[i + 1].rstrip('\n').rstrip('---').strip()
+                chunk_summaries.append((chunk_num, summary))
+
+        if not chunk_summaries:
+            logger.warning("  无法解析 chunk 摘要，回退到原始生成方式")
+            return self._generate_final_markdown(
+                summary_path, [], chunk_frames, '',
+                '', original_filename)
+
+        # 构建 frame 元数据
+        frame_info_lines = []
+        total_frames = 0
+        for idx in sorted(chunk_frames.keys()):
+            count = len(chunk_frames[idx])
+            total_frames += count
+            frame_info_lines.append(
+                f"  - Chunk {idx+1}: {count} 张截图")
+
+        # 构建 prompt
+        summaries_text_parts = []
+        for chunk_num, summary in chunk_summaries:
+            summaries_text_parts.append(
+                f"### Chunk {chunk_num}\n\n{summary}")
+
+        compose_prompt = f"""你是一位专业的技术编辑。以下是一段课程视频的 {len(chunk_summaries)} 个分段摘要。每个分段都有对应的截图。
+
+## 截图信息
+{chr(10).join(frame_info_lines)}
+共 {total_frames} 张截图。
+
+## 你的任务
+
+1. **合并去重**：将多个 chunk 的摘要合并为一份完整笔记。同一知识点可能在不同 chunk 中重复出现，请合并为一个章节。
+2. **重组章节**：用逻辑章节结构（`## 一、...`、`## 二、...`）替代机械的 chunk 编号。
+3. **插入截图标记**：在你认为合适的位置插入 `[FRAMES:chunk_N]` 标记（N 为 chunk 编号）。例如 `[FRAMES:chunk_3]` 表示此处插入 chunk 3 的全部截图。截图应该出现在与其内容相关的段落附近。
+4. **不要集中放置**：不要把所有截图堆在一处。尽量分散到相关章节中。
+5. **标题用 `# {original_filename}`**
+
+## 分段摘要
+
+{chr(10).join(summaries_text_parts)}
+
+## 输出规则
+
+- 添加 `> 主题：...` 摘要行
+- 保留项目符号、加粗、表格、LaTeX、代码块原样
+- 输出中文
+- 禁止元对话（不要说"以下是整理后的笔记"）
+- 不添加原始摘要中不存在的新内容
+- 所有 `[FRAMES:chunk_N]` 标记必须保留
+
+直接输出完整的 markdown 文档。"""
+
+        # 发送给 LLM
+        final_md_path = os.path.join(
+            self.output_dir, f"{original_filename}.md")
+
+        for attempt in range(1, 6):
+            try:
+                client = OpenAI(
+                    api_key=os.environ.get(
+                        "DEEPSEEK_API_KEY", DEEPSEEK_API_KEY),
+                    base_url=DEEPSEEK_BASE_URL
+                )
+                response = client.chat.completions.create(
+                    model=PRIMARY_MODEL,
+                    messages=[{"role": "user", "content": compose_prompt}],
+                    temperature=0.3,
+                )
+                result = response.choices[0].message.content
+                if not result or not result.strip():
+                    raise RuntimeError("LLM 返回空结果")
+
+                result = result.strip()
+
+                # 替换 [FRAMES:chunk_N] 为实际图片
+                def replace_frames(m):
+                    chunk_idx = int(m.group(1)) - 1
+                    frames = chunk_frames.get(chunk_idx, [])
+                    if not frames:
+                        return ''
+                    lines = []
+                    for fp in frames:
+                        rel = os.path.relpath(fp, os.path.dirname(final_md_path))
+                        rel = rel.replace(os.sep, '/')
+                        rel = quote(rel, safe="/:-_.()")
+                        lines.append(f'![截图]({rel})')
+                    return '\n\n'.join(lines)
+
+                result = re.sub(
+                    r'\[FRAMES:chunk_(\d+)\]', replace_frames, result)
+
+                # 写文件
+                with open(final_md_path, 'w', encoding='utf-8') as f:
+                    f.write(result)
+                    if not result.endswith('\n'):
+                        f.write('\n')
+
+                new_lines = len(result.splitlines())
+                logger.info(
+                    f"  LLM 编排完成: {len(chunk_summaries)} chunks → {new_lines} 行")
+
+                return final_md_path
+
+            except Exception as e:
+                logger.warning(f"  LLM 编排第 {attempt}/5 次失败: {e}")
+                if attempt < 5:
+                    time.sleep(30)
+                else:
+                    logger.warning("  LLM 编排失败，回退到原始方式")
+                    return self._generate_final_markdown(
+                        summary_path, [], chunk_frames, '',
+                        '', original_filename)
+
+        return final_md_path
         """
         生成最终的markdown文档，包含总结和截图
         
