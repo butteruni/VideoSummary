@@ -316,8 +316,8 @@ def generate_chunk_summary(client, chunk_text: str, current_idx: int,
 {frame_list}
 
 在笔记中适当位置插入截图引用，格式为 `[SCREENSHOT:文件名.jpg]`。
-不要把所有截图堆在一起，尽量分散到相关内容附近。
-截图是辅助说明文字的，先写文字再放截图。"""
+截图放在相关文字**之前**（先看图再看分析），不要放在文字后面。
+不要把所有的图堆在一起，分散放到各自相关的内容前面。"""
 
     logger.info(
         f"   >>> LLM 总结第 {current_idx}/{total_chunks} 片段，长度 {len(chunk_text)} 字"
