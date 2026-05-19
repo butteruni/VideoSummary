@@ -295,9 +295,11 @@ def detect_language(content: str, chinese_threshold: float = 0.1) -> str:
 
 
 def generate_chunk_summary(client, chunk_text: str, current_idx: int,
-                           total_chunks: int, model_name: str = PRIMARY_MODEL) -> str:
+                           total_chunks: int, frame_paths: list = None,
+                           model_name: str = PRIMARY_MODEL) -> str:
     """
-    调用 DeepSeek API 生成单个片段的总结
+    调用 DeepSeek API 生成单个片段的总结。
+    如果提供了 frame_paths，LLM 会在笔记中自然引用截图。
     """
     if client is None:
         raise RuntimeError("DeepSeek client 未初始化")
@@ -305,8 +307,21 @@ def generate_chunk_summary(client, chunk_text: str, current_idx: int,
     prompt = BASE_SYSTEM_PROMPT.format(
         current=current_idx, total=total_chunks) + "\n\n" + chunk_text
 
+    if frame_paths:
+        frame_list = "\n".join(f"  - {os.path.basename(p)}" for p in frame_paths)
+        prompt += f"""
+
+## 本段关键截图（{len(frame_paths)} 张）
+
+{frame_list}
+
+在笔记中适当位置插入截图引用，格式为 `[SCREENSHOT:文件名.jpg]`。
+不要把所有截图堆在一起，尽量分散到相关内容附近。
+截图是辅助说明文字的，先写文字再放截图。"""
+
     logger.info(
-        f"   >>> LLM 总结第 {current_idx}/{total_chunks} 片段，长度 {len(chunk_text)} 字")
+        f"   >>> LLM 总结第 {current_idx}/{total_chunks} 片段，长度 {len(chunk_text)} 字"
+        + (f"，附带 {len(frame_paths)} 张截图" if frame_paths else ""))
     response = client.chat.completions.create(
         model=model_name,
         messages=[
@@ -1323,18 +1338,19 @@ class VideoSummaryApp:
                 self.output_dir, f"{video_title}_frames")
             os.makedirs(frames_dir, exist_ok=True)
 
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                summary_future = executor.submit(
-                    self._generate_summary_with_chunks,
-                    temp_text_file, chunk_texts, video_title
-                )
-                frames_future = executor.submit(
-                    self._extract_frames_for_chunks,
-                    video_path, chunks, frames_dir,
-                    frame_extraction_interval, skip_similar_frames
-                )
-                summary_path = summary_future.result()
-                chunk_frames = frames_future.result()
+            # 先提取帧（需要视频文件）
+            logger.info("\n[步骤 4/5] 提取关键帧...")
+            chunk_frames = self._extract_frames_for_chunks(
+                video_path, chunks, frames_dir,
+                frame_extraction_interval, skip_similar_frames
+            )
+
+            # 再把帧信息和字幕一起发给 LLM
+            logger.info("\n[步骤 5/5] 生成AI总结（附带截图信息）...")
+            summary_path = self._generate_summary_with_chunks(
+                temp_text_file, chunk_texts, video_title,
+                chunk_frames=chunk_frames
+            )
 
         # 获取原始文件名
         if provided_title:
@@ -1348,23 +1364,21 @@ class VideoSummaryApp:
         else:
             original_filename = video_title
 
-        # 5. 生成最终 markdown
-        # 视频模式：保留 chunk 结构保证截图位置准确
-        # 文本模式：LLM 合并去重（无截图，不会破坏布局）
+        # 6. 生成最终 markdown
         if not self.text_only and not self.test_mode:
-            logger.info("\n[步骤 5/5] 生成最终markdown文档...")
-            final_md_path = self._generate_final_markdown(
-                summary_path, chunk_texts, chunk_frames, video_title, video_path, original_filename
-            )
+            # 视频模式：LLM 已在笔记中嵌入 [SCREENSHOT:xxx] 标记，替换为实际图片
+            logger.info("\n[步骤 6/6] 替换截图标记，生成最终文档...")
+            final_md_path = self._replace_screenshot_markers(
+                summary_path, chunk_frames, original_filename)
         elif self.text_only and not self.test_mode:
-            logger.info("\n[步骤 5/5] LLM 合并去重（纯文本）...")
-            # 先拼成带 "## 第 N 部分" 的临时文件，再合并
+            # 文本模式：先生成 chunk 结构，再 LLM 合并去重
+            logger.info("\n[步骤 6/6] 生成最终markdown + LLM 合并去重...")
             final_md_path = self._generate_final_markdown(
                 summary_path, chunk_texts, chunk_frames, video_title, video_path, original_filename
             )
             final_md_path = self._consolidate_markdown(final_md_path)
         else:
-            logger.info("\n[步骤 5/5] 生成最终markdown文档（测试模式）...")
+            logger.info("\n[步骤 6/6] 生成最终markdown文档（测试模式）...")
             final_md_path = self._generate_final_markdown(
                 summary_path, chunk_texts, chunk_frames, video_title, video_path, original_filename
             )
@@ -1715,14 +1729,15 @@ class VideoSummaryApp:
         return chunks
 
     def _generate_summary_with_chunks(self, text_file: str, chunks: List[str],
-                                      video_title: str) -> str:
+                                       video_title: str,
+                                       chunk_frames: Dict[int, List[str]] = None) -> str:
         """
-        生成总结并返回总结文件路径
-        这里需要调用Summary.py的功能，但需要获取每个chunk的总结
+        生成总结并返回总结文件路径。
+        如果提供 chunk_frames，LLM 会在每个 chunk 的笔记中自然引用截图。
         """
-        # 生成每个chunk的总结
         summaries = []
         total_chunks = len(chunks)
+        frames = chunk_frames or {}
 
         if self.test_mode:
             logger.info("🔧 测试模式开启：不会调用LLM，直接输出Prompt内容")
@@ -1748,14 +1763,18 @@ class VideoSummaryApp:
 
             for i, chunk in enumerate(chunks):
                 current_idx = i + 1
+                chunk_frame_paths = frames.get(i, []) if frames else None
 
-                logger.info(f"  总结片段 {current_idx}/{total_chunks}...")
+                logger.info(f"  总结片段 {current_idx}/{total_chunks}..."
+                            + (f" ({len(chunk_frame_paths)} 帧)" if chunk_frame_paths else ""))
 
                 max_retries = 5
                 for attempt in range(1, max_retries + 1):
                     try:
                         summary = generate_chunk_summary(
-                            client, chunk, current_idx, total_chunks, PRIMARY_MODEL
+                            client, chunk, current_idx, total_chunks,
+                            frame_paths=chunk_frame_paths,
+                            model_name=PRIMARY_MODEL
                         )
                         if summary and summary.strip():
                             summaries.append(summary)
@@ -1972,6 +1991,52 @@ class VideoSummaryApp:
                         summary_path, [], chunk_frames, '',
                         '', original_filename)
 
+        return final_md_path
+
+    def _replace_screenshot_markers(self, summary_path: str,
+                                     chunk_frames: Dict[int, List[str]],
+                                     original_filename: str) -> str:
+        """
+        将 LLM 输出的 [SCREENSHOT:filename.jpg] 替换为实际图片路径。
+        文件名 → 完整路径的映射通过 chunk_frames 查找。
+        """
+        import re
+
+        # 构建文件名→完整路径的映射
+        name_to_path = {}
+        for frames in chunk_frames.values():
+            for fp in frames:
+                name_to_path[os.path.basename(fp)] = fp
+
+        with open(summary_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        final_md_path = os.path.join(
+            self.output_dir, f"{original_filename}.md")
+
+        def replace_match(m):
+            filename = m.group(1)
+            full_path = name_to_path.get(filename)
+            if full_path:
+                rel = os.path.relpath(
+                    full_path, os.path.dirname(final_md_path))
+                rel = rel.replace(os.sep, '/')
+                rel = quote(rel, safe="/:-_.()")
+                return f'![截图]({rel})'
+            return ''  # 找不到则移除标记
+
+        # 替换 [SCREENSHOT:xxx.jpg] 和 [SCREENSHOT:xxx] 两种格式
+        content = re.sub(
+            r'\[SCREENSHOT:([^\]]+\.(?:jpg|png|jpeg|webp))\]',
+            replace_match, content, flags=re.IGNORECASE)
+
+        with open(final_md_path, 'w', encoding='utf-8') as f:
+            f.write(content)
+            if not content.endswith('\n'):
+                f.write('\n')
+
+        img_count = len(re.findall(r'!\[截图\]\(', content))
+        logger.info(f"  替换完成: {img_count} 张截图")
         return final_md_path
 
     def _generate_final_markdown(self, summary_path: str, chunks: List[str],
