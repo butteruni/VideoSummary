@@ -1973,95 +1973,79 @@ class VideoSummaryApp:
                         '', original_filename)
 
         return final_md_path
+
+    def _generate_final_markdown(self, summary_path: str, chunks: List[str],
+                                 chunk_frames: Dict[int, List[str]],
+                                 video_title: str, video_path: str, original_filename: str) -> str:
         """
-        生成最终的markdown文档，包含总结和截图
-        
-        Args:
-            summary_path: 总结临时文件路径
-            chunks: 片段文本列表
-            chunk_frames: 片段索引到帧路径列表的映射
-            video_title: 处理后的视频标题（用于内部标识）
-            video_path: 视频文件路径（可能为None）
-            original_filename: 原始文件名（用于输出文件名和一级标题）
+        生成最终 markdown，截图散布在段落之间（而不是堆在每部分开头）。
         """
         # 读取总结内容
         with open(summary_path, 'r', encoding='utf-8') as f:
             summary_content = f.read()
 
-        # 使用原始文件名作为输出文件名
         final_md_path = os.path.join(
             self.output_dir, f"{original_filename}.md")
 
         with open(final_md_path, 'w', encoding='utf-8') as f:
-            # 写入一级标题（原始文件名）
             f.write(f"# {original_filename}\n\n")
 
-            # 解析总结，找到每个部分
-            # 使用更灵活的方式分割内容
             parts = re.split(r'\n## 第 (\d+) 部分\n', summary_content)
-
-            # 如果分割成功，parts应该是: [标题和开头内容, '1', 第一部分内容, '2', 第二部分内容, ...]
-            # parts[0] 包含 "> 由 AI 生成，共 X 部分\n\n"，我们直接跳过它
-            if len(parts) > 1:
-
-                # 处理每个部分
-                for i in range(1, len(parts), 2):
-                    if i + 1 >= len(parts):
-                        break
-
-                    part_num = parts[i]
-                    part_content = parts[i + 1]
-
-                    try:
-                        chunk_idx = int(part_num) - 1
-                    except ValueError:
-                        continue
-
-                    # 写入部分标题
-                    f.write(f"\n## 第 {part_num} 部分\n\n")
-
-                    frames_for_chunk = chunk_frames.get(chunk_idx, [])
-
-                    # 再写总结内容（去除末尾的---分隔符）
-                    part_content_clean = part_content.rstrip(
-                        '\n').rstrip('---').rstrip('\n').strip()
-
-                    sections = [
-                        s.strip() for s in re.split(
-                            r'\n\s*---+\s*\n', part_content_clean)
-                        if s.strip()
-                    ]
-
-                    inserted_by_section = False
-                    if frames_for_chunk and len(sections) > 1:
-                        allocations = self._allocate_frame_counts(
-                            sections, len(frames_for_chunk))
-                        frame_cursor = 0
-                        for section_idx, section_text in enumerate(sections):
-                            num_frames = allocations[section_idx] if section_idx < len(
-                                allocations) else 0
-                            if num_frames > 0:
-                                section_frames = frames_for_chunk[
-                                    frame_cursor:frame_cursor + num_frames]
-                                self._write_frame_block(
-                                    f, section_frames, final_md_path)
-                                frame_cursor += num_frames
-                            f.write(section_text)
-                            f.write("\n\n")
-                            if section_idx < len(sections) - 1:
-                                f.write("---\n\n")
-                        inserted_by_section = True
-
-                    if not inserted_by_section:
-                        if frames_for_chunk:
-                            self._write_frame_block(
-                                f, frames_for_chunk, final_md_path)
-                        f.write(part_content_clean)
-
-                    f.write("\n\n---\n\n")
-            else:
-                # 无法按 "## 第 N 部分" 分割，直接写入整个内容
+            if len(parts) <= 1:
                 f.write(summary_content)
+                return final_md_path
+
+            for i in range(1, len(parts), 2):
+                if i + 1 >= len(parts):
+                    break
+                part_num = parts[i]
+                part_content = parts[i + 1]
+                try:
+                    chunk_idx = int(part_num) - 1
+                except ValueError:
+                    continue
+
+                f.write(f"\n## 第 {part_num} 部分\n\n")
+                frames = chunk_frames.get(chunk_idx, [])
+                part_clean = part_content.rstrip('\n').rstrip('---').rstrip('\n').strip()
+
+                if not frames:
+                    f.write(part_clean)
+                    f.write("\n\n---\n\n")
+                    continue
+
+                # 按 --- 分隔符拆分子章节，截图穿插其间
+                subsections = [s.strip() for s in re.split(
+                    r'\n\s*---+\s*\n', part_clean) if s.strip()]
+
+                if len(subsections) <= 1:
+                    # 无子章节：截图放开头一小部分，其余放末尾
+                    intro_count = max(1, len(frames) // 4)
+                    self._write_frame_block(f, frames[:intro_count], final_md_path)
+                    f.write('\n')
+                    f.write(subsections[0])
+                    if len(frames) > intro_count:
+                        f.write('\n\n')
+                        self._write_frame_block(f, frames[intro_count:], final_md_path)
+                else:
+                    # 有子章节：均分截图穿插
+                    f_per_sub = max(1, len(frames) // len(subsections))
+                    extra = len(frames) - f_per_sub * len(subsections)
+                    cursor = 0
+                    for si, sub in enumerate(subsections):
+                        count = f_per_sub + (1 if si >= len(subsections) - extra else 0)
+                        if count > 0 and cursor < len(frames):
+                            batch = frames[cursor:cursor + count]
+                            cursor += count
+                            self._write_frame_block(f, batch, final_md_path)
+                            f.write('\n')
+                        f.write(sub)
+                        if si < len(subsections) - 1:
+                            f.write("\n\n---\n\n")
+                        else:
+                            f.write('\n')
+
+                f.write("\n\n---\n\n")
 
         return final_md_path
 
