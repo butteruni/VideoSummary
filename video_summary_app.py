@@ -1348,13 +1348,23 @@ class VideoSummaryApp:
         else:
             original_filename = video_title
 
-        # 5. LLM 一次性编排完整最终笔记（合并 + 去重 + 截图位置）
-        if not self.test_mode:
-            logger.info("\n[步骤 5/5] LLM 编排最终笔记...")
-            final_md_path = self._llm_compose_final(
-                summary_path, chunk_frames, original_filename)
-        else:
+        # 5. 生成最终 markdown
+        # 视频模式：保留 chunk 结构保证截图位置准确
+        # 文本模式：LLM 合并去重（无截图，不会破坏布局）
+        if not self.text_only and not self.test_mode:
             logger.info("\n[步骤 5/5] 生成最终markdown文档...")
+            final_md_path = self._generate_final_markdown(
+                summary_path, chunk_texts, chunk_frames, video_title, video_path, original_filename
+            )
+        elif self.text_only and not self.test_mode:
+            logger.info("\n[步骤 5/5] LLM 合并去重（纯文本）...")
+            # 先拼成带 "## 第 N 部分" 的临时文件，再合并
+            final_md_path = self._generate_final_markdown(
+                summary_path, chunk_texts, chunk_frames, video_title, video_path, original_filename
+            )
+            final_md_path = self._consolidate_markdown(final_md_path)
+        else:
+            logger.info("\n[步骤 5/5] 生成最终markdown文档（测试模式）...")
             final_md_path = self._generate_final_markdown(
                 summary_path, chunk_texts, chunk_frames, video_title, video_path, original_filename
             )
